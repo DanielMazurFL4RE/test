@@ -28,9 +28,10 @@ if (!DISCORD_TOKEN.includes('.') || DISCORD_TOKEN.trim().length < 50) {
   console.error('❌ DISCORD_TOKEN wygląda na nieprawidłowy (wklej czysty token bota, bez "Bot " i bez cudzysłowów).');
   process.exit(1);
 }
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-if (!GEMINI_API_KEY) {
-  console.error('❌ Brak GEMINI_API_KEY (lub GOOGLE_API_KEY) w zmiennych środowiskowych.');
+const GEMINI_API_KEY_1 = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
+const GEMINI_API_KEY_2 = process.env.GEMINI_API_KEY_2 || process.env.GOOGLE_API_KEY_2 || '';
+if (!GEMINI_API_KEY_1 && !GEMINI_API_KEY_2) {
+  console.error('❌ Brak GEMINI_API_KEY (ani GEMINI_API_KEY_2). Ustaw przynajmniej jeden klucz.');
   process.exit(1);
 }
 
@@ -62,10 +63,85 @@ function userNickFromMessage(msg) {
 }
 
 /* =========================
-   Gemini
+   Gemini: model + PULA KLIENTÓW z failoverem
    ========================= */
 const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+const FAILOVER_COOLDOWN_MS = (parseInt(process.env.GEMINI_FAILOVER_COOLDOWN_SEC || '600', 10)) * 1000;
+
+// Pula 1-2 klientów, z obsługą wyczerpania limitu
+class GeminiPool {
+  constructor(keys) {
+    this.clients = keys
+      .filter(Boolean)
+      .map((k, i) => ({
+        client: new GoogleGenAI({ apiKey: k }),
+        exhaustedUntil: 0,
+        label: i === 0 ? 'primary' : 'secondary',
+      }));
+    this.idx = 0;
+  }
+  _now() { return Date.now(); }
+  _findAvailableIndex() {
+    const now = this._now();
+    for (let i = 0; i < this.clients.length; i++) {
+      const n = (this.idx + i) % this.clients.length;
+      if (this.clients[n].exhaustedUntil <= now) return n;
+    }
+    // jeśli wszystkie "zmęczone", weź aktualny (spróbuj mimo wszystko)
+    return this.idx;
+  }
+  _markExhausted(i, reason) {
+    this.clients[i].exhaustedUntil = this._now() + FAILOVER_COOLDOWN_MS;
+    const lbl = this.clients[i].label;
+    console.warn(`⚠️ Gemini key ${lbl} oznaczony jako wyczerpany na ${FAILOVER_COOLDOWN_MS/1000}s. Powód: ${reason || 'quota/rate limit'}`);
+    this.idx = (i + 1) % this.clients.length;
+  }
+  _isQuotaError(err) {
+    // staraj się wyłapać 429/RESOURCE_EXHAUSTED/"quota"
+    const pick = (o, k) => (o && typeof o === 'object' ? o[k] : undefined);
+    let msg = (pick(err, 'message') || '').toString();
+    let code = pick(err, 'code') || pick(err, 'statusCode') || pick(err, 'status');
+    let status = pick(err, 'status');
+    // Czasem message zawiera zserializowane JSON:
+    try {
+      if (msg.trim().startsWith('{')) {
+        const j = JSON.parse(msg);
+        const e = j.error || j;
+        msg = (e.message || msg).toString();
+        code = e.code || code;
+        status = e.status || status;
+      }
+    } catch {}
+    const s = (status || '').toString().toUpperCase();
+    const m = (msg || '').toLowerCase();
+    return code === 429 || s === 'RESOURCE_EXHAUSTED' || /quota|rate limit|resource_exhausted|exceeded/.test(m);
+  }
+  async call(fn, opLabel = 'op') {
+    if (this.clients.length === 0) throw new Error('No Gemini clients configured');
+    let lastErr;
+    const tried = new Set();
+    for (let attempt = 0; attempt < this.clients.length; attempt++) {
+      const i = this._findAvailableIndex();
+      if (tried.has(i)) break;
+      tried.add(i);
+      const c = this.clients[i].client;
+      const lbl = this.clients[i].label;
+      try {
+        // console.log(`[gemini] using ${lbl} for ${opLabel}`);
+        return await fn(c, lbl);
+      } catch (e) {
+        lastErr = e;
+        if (this._isQuotaError(e) && this.clients.length > 1) {
+          this._markExhausted(i, e?.message);
+          continue; // spróbuj następnym klientem
+        }
+        throw e; // inny błąd – nie próbuj dalej
+      }
+    }
+    throw lastErr;
+  }
+}
+const gemini = new GeminiPool([GEMINI_API_KEY_1, GEMINI_API_KEY_2]);
 
 function buildToolsFromEnv() {
   const tools = [];
@@ -117,7 +193,7 @@ const sessionSummary = new Map(); // sk -> string
 // Cache name per sesja
 const sessionCache = new Map(); // sk -> { name, createdAt }
 
-/* Szacowanie tokenów „na oko” (dla progów, nie do rozliczeń) */
+/* Szacowanie tokenów „na oko” */
 const roughTokens = (s) => Math.ceil((s || '').length / 4);
 
 /* Buduje skrót, gdy historia rośnie */
@@ -125,7 +201,6 @@ async function summarizeIfNeeded(sk, channelId) {
   const priv = getUserHist(sk);
   const shared = getSharedHist(channelId);
 
-  // szybkie sprawdzenie wielkości
   const privText = priv.map(t => `${t.role}: ${t.text}`).join('\n');
   const sharedText = shared.map(t => `[@${t.speaker}]: ${t.text}`).join('\n');
   const combined = `${privText}\n---\n${sharedText}`;
@@ -146,7 +221,10 @@ ${sharedText.slice(-4000)}
   ];
 
   try {
-    const res = await ai.models.generateContent({ model: MODEL, contents: prompt });
+    const res = await gemini.call(
+      (c) => c.models.generateContent({ model: MODEL, contents: prompt }),
+      'summarize'
+    );
     const summary = (res.text || '').slice(0, 4000);
     if (summary) sessionSummary.set(sk, summary);
 
@@ -158,38 +236,44 @@ ${sharedText.slice(-4000)}
   }
 }
 
-/* Tworzy/uzupełnia cache: persona + skrót sesji */
+/* Tworzy/uzupełnia cache: persona + skrót sesji, z failoverem i dwoma kształtami API */
 async function ensureSessionCache(sk) {
   const existing = sessionCache.get(sk);
   if (existing && (Date.now() - existing.createdAt) / 1000 < CACHE_TTL_SEC) {
     return existing.name; // świeży
   }
-
   const summaryText = sessionSummary.get(sk) || '';
-  // Spróbuj dwóch kształtów API (różne wersje SDK):
+
+  // shape A: { config: { systemInstruction, contents, ttl: "3600s" } }
   try {
-    const cache = await ai.caches.create({
-      model: MODEL,
-      // część stała do cache: persona + obecny skrót rozmowy
-      config: {
-        systemInstruction: PERSONA,
-        contents: summaryText ? [{ role: 'user', parts: [{ text: summaryText }]}] : [],
-        ttl: `${CACHE_TTL_SEC}s`,
-      },
-    });
+    const cache = await gemini.call(
+      (c) => c.caches.create({
+        model: MODEL,
+        config: {
+          systemInstruction: PERSONA,
+          contents: summaryText ? [{ role: 'user', parts: [{ text: summaryText }]}] : [],
+          ttl: `${CACHE_TTL_SEC}s`,
+        },
+      }),
+      'cache.create[A]'
+    );
     sessionCache.set(sk, { name: cache.name, createdAt: Date.now() });
     return cache.name;
-  } catch (e1) {
+  } catch (eA) {
+    // shape B: { contents, ttlSeconds }
     try {
-      const cache = await ai.caches.create({
-        model: MODEL,
-        contents: summaryText ? [{ role: 'user', parts: [{ text: summaryText }]}] : [],
-        ttlSeconds: CACHE_TTL_SEC,
-      });
+      const cache = await gemini.call(
+        (c) => c.caches.create({
+          model: MODEL,
+          contents: summaryText ? [{ role: 'user', parts: [{ text: summaryText }]}] : [],
+          ttlSeconds: CACHE_TTL_SEC,
+        }),
+        'cache.create[B]'
+      );
       sessionCache.set(sk, { name: cache.name, createdAt: Date.now() });
       return cache.name;
-    } catch (e2) {
-      console.warn('⚠️ Cache niedostępny – lecimy bez cache.', e2?.message || e2);
+    } catch (eB) {
+      console.warn('⚠️ Cache niedostępny – lecimy bez cache.', eB?.message || eB);
       return null;
     }
   }
@@ -212,7 +296,6 @@ function toWindowedContents(sk, channelId, myNick) {
       }]
     : [];
 
-  // dodaj krótki „nagłówek sesji” jako user-msg (bez powiększania systemInstruction)
   const header = [{
     role: 'user',
     parts: [{ text: `Aktualny rozmówca: ${myNick}. Odpowiadaj zwięźle.` }]
@@ -348,7 +431,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
 
       if (useStream) {
-        const stream = await ai.models.generateContentStream({ model: MODEL, contents, config: genCfg });
+        const stream = await gemini.call(
+          (c) => c.models.generateContentStream({ model: MODEL, contents, config: genCfg }),
+          'generateContentStream'
+        );
         let accum = '';
         let lastEdit = Date.now();
 
@@ -374,7 +460,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
         }
       } else {
-        const res = await ai.models.generateContent({ model: MODEL, contents, config: genCfg });
+        const res = await gemini.call(
+          (c) => c.models.generateContent({ model: MODEL, contents, config: genCfg }),
+          'generateContent'
+        );
         const answer = res.text ?? '(brak treści)';
 
         pushUserTurn(sk, 'model', answer);
@@ -440,7 +529,10 @@ client.on(Events.MessageCreate, async (msg) => {
 
     const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
     if (useStream) {
-      const stream = await ai.models.generateContentStream({ model: MODEL, contents, config: genCfg });
+      const stream = await gemini.call(
+        (c) => c.models.generateContentStream({ model: MODEL, contents, config: genCfg }),
+        'generateContentStream'
+      );
       let accum = '';
       let lastEdit = Date.now();
       const replyMsg = await msg.reply('⏳ …');
@@ -465,7 +557,10 @@ client.on(Events.MessageCreate, async (msg) => {
         for (const ch of chunks) await msg.channel.send({ content: ch });
       }
     } else {
-      const res = await ai.models.generateContent({ model: MODEL, contents, config: genCfg });
+      const res = await gemini.call(
+        (c) => c.models.generateContent({ model: MODEL, contents, config: genCfg }),
+        'generateContent'
+      );
       const answer = res.text ?? '(brak treści)';
 
       pushUserTurn(sk, 'model', answer);
