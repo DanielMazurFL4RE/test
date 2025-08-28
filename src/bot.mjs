@@ -1,21 +1,69 @@
+// src/bot.mjs
 import 'dotenv/config';
-import { Client, GatewayIntentBits, Events, Partials } from 'discord.js';
+import {
+  Client,
+  GatewayIntentBits,
+  Events,
+  Partials,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+} from 'discord.js';
 import { GoogleGenAI } from '@google/genai';
 
+// === Preflight ENV checks (czytelne błędy zamiast TokenInvalid) ===
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+if (!DISCORD_TOKEN) {
+  console.error('❌ Brak DISCORD_TOKEN w zmiennych środowiskowych.');
+  process.exit(1);
+}
+if (!DISCORD_TOKEN.includes('.') || DISCORD_TOKEN.trim().length < 50) {
+  console.error('❌ DISCORD_TOKEN wygląda na nieprawidłowy (wklej czysty token bota, bez "Bot " i bez cudzysłowów).');
+  process.exit(1);
+}
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+if (!GEMINI_API_KEY) {
+  console.error('❌ Brak GEMINI_API_KEY (lub GOOGLE_API_KEY) w zmiennych środowiskowych.');
+  process.exit(1);
+}
+
+// === Model i SDK Gemini ===
 const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY
-});
+// === Definicje slash-commands (rejestrowane automatycznie) ===
+const commands = [
+  new SlashCommandBuilder()
+    .setName('gemini')
+    .setDescription('Porozmawiaj z Gemini')
+    .addStringOption(o =>
+      o.setName('prompt')
+        .setDescription('Twoja wiadomość do Gemini')
+        .setRequired(true)
+    )
+    .addBooleanOption(o =>
+      o.setName('ephemeral')
+        .setDescription('Pokaż odpowiedź tylko Tobie (domyślnie: nie)')
+    )
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName('gemini-reset')
+    .setDescription('Wyczyść kontekst rozmowy w tym kanale')
+    .toJSON()
+];
 
+const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+
+// === Klient Discord ===
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
-  partials: [Partials.Channel]
+  partials: [Partials.Channel],
 });
 
 // prosta pamięć kontekstu per kanał
 const memory = new Map(); // channelId -> [{ role: 'user'|'model', text }]
-const SYS_PROMPT = `Jesteś pomocnym asystentem na Discordzie. Odpowiadaj zwięźle i jasno.`;
+const SYS_PROMPT = `Jesteś wrednym asystentem na Discordzie. Odpowiadaj zwięźle i jasno w stylu serialu Chłopaki z Baraków.`;
 
 function getHistory(channelId) {
   if (!memory.has(channelId)) memory.set(channelId, []);
@@ -50,10 +98,44 @@ function chunkForDiscord(text, limit = 2000) {
   return chunks;
 }
 
-client.once(Events.ClientReady, (c) => {
+// === Auto-rejestracja komend po starcie (dla wszystkich gildii, w których bot już jest) ===
+client.once(Events.ClientReady, async (c) => {
   console.log(`Zalogowano jako ${c.user.tag}`);
+  try {
+    await c.application?.fetch();
+    const appId = c.application.id;
+
+    for (const [, guild] of c.guilds.cache) {
+      try {
+        await rest.put(
+          Routes.applicationGuildCommands(appId, guild.id),
+          { body: commands }
+        );
+        console.log(`✅ Komendy zarejestrowane w ${guild.name} (${guild.id})`);
+      } catch (e) {
+        console.error(`❌ Rejestracja komend w ${guild?.name || guild?.id}:`, e);
+      }
+    }
+  } catch (e) {
+    console.error('❌ Nie udało się pobrać aplikacji / zarejestrować komend:', e);
+  }
 });
 
+// === Auto-rejestracja komend przy dołączeniu do nowej gildii ===
+client.on('guildCreate', async (guild) => {
+  try {
+    await client.application?.fetch();
+    await rest.put(
+      Routes.applicationGuildCommands(client.application.id, guild.id),
+      { body: commands }
+    );
+    console.log(`✨ Komendy dodane po zaproszeniu: ${guild.name} (${guild.id})`);
+  } catch (e) {
+    console.error('❌ Rejestracja komend po join:', e);
+  }
+});
+
+// === Obsługa komend ===
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
@@ -139,4 +221,5 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+// === Start ===
+client.login(DISCORD_TOKEN);
