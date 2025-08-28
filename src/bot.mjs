@@ -76,7 +76,7 @@ const client = new Client({
 
 // prosta pamięć kontekstu per kanał
 const memory = new Map(); // channelId -> [{ role: 'user'|'model', text }]
-const SYS_PROMPT = `Jesteś wrednym asystentem na Discordzie. Odpowiadaj obrazliwie i z przeklenstwami jak w CHlopakach z Barakow.`;
+const SYS_PROMPT = `Jesteś wrednym asystentem na Discordzie. Odpowiadaj obrazliwie i z przeklenstwami jak w CHlopakach z Barakow. Jak postać Rick, ale odpisuj max jednym zdaniem`;
 
 function getHistory(channelId) {
   if (!memory.has(channelId)) memory.set(channelId, []);
