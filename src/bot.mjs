@@ -68,7 +68,6 @@ function userNickFromMessage(msg) {
 const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const FAILOVER_COOLDOWN_MS = (parseInt(process.env.GEMINI_FAILOVER_COOLDOWN_SEC || '600', 10)) * 1000;
 
-// Pula 1-2 klientów, z obsługą wyczerpania limitu
 class GeminiPool {
   constructor(keys) {
     this.clients = keys
@@ -87,7 +86,6 @@ class GeminiPool {
       const n = (this.idx + i) % this.clients.length;
       if (this.clients[n].exhaustedUntil <= now) return n;
     }
-    // jeśli wszystkie "zmęczone", weź aktualny (spróbuj mimo wszystko)
     return this.idx;
   }
   _markExhausted(i, reason) {
@@ -97,12 +95,10 @@ class GeminiPool {
     this.idx = (i + 1) % this.clients.length;
   }
   _isQuotaError(err) {
-    // staraj się wyłapać 429/RESOURCE_EXHAUSTED/"quota"
     const pick = (o, k) => (o && typeof o === 'object' ? o[k] : undefined);
     let msg = (pick(err, 'message') || '').toString();
     let code = pick(err, 'code') || pick(err, 'statusCode') || pick(err, 'status');
     let status = pick(err, 'status');
-    // Czasem message zawiera zserializowane JSON:
     try {
       if (msg.trim().startsWith('{')) {
         const j = JSON.parse(msg);
@@ -127,15 +123,14 @@ class GeminiPool {
       const c = this.clients[i].client;
       const lbl = this.clients[i].label;
       try {
-        // console.log(`[gemini] using ${lbl} for ${opLabel}`);
         return await fn(c, lbl);
       } catch (e) {
         lastErr = e;
         if (this._isQuotaError(e) && this.clients.length > 1) {
           this._markExhausted(i, e?.message);
-          continue; // spróbuj następnym klientem
+          continue;
         }
-        throw e; // inny błąd – nie próbuj dalej
+        throw e;
       }
     }
     throw lastErr;
@@ -150,7 +145,7 @@ function buildToolsFromEnv() {
   return tools;
 }
 
-/* Persona/system prompt — LEKKI (reszta w cache) */
+/* Persona/system prompt — TERAZ W KAŻDYM ŻĄDANIU */
 const PERSONA = `Jesteś asystentem na Discordzie. Odpowiadaj obrazliwie i z przeklenstwami jak w CHlopakach z Barakow. Jak postać Rick, ale odpisuj max jednym zdaniem. Czasem staraj się być pomocny. Odpowiadaj krótko (1-2 zdania). Nie myl rozmówców: zawsze kojarz wypowiedzi z właściwymi nickami.
 Masz dwie warstwy pamięci: prywatną (bieżący użytkownik) i wspólną dla kanału (ostatnie wypowiedzi różnych osób).`;
 
@@ -161,7 +156,6 @@ const MAX_TURNS_PRIVATE = parseInt(process.env.MEM_TURNS_PRIVATE || '12', 10);
 const MAX_TURNS_SHARED  = parseInt(process.env.MEM_TURNS_SHARED  || '8', 10);
 const CACHE_TTL_SEC     = parseInt(process.env.GEMINI_CACHE_TTL_SEC || '3600', 10);
 
-// Prywatna per (kanał + user)
 const userMemory = new Map(); // `${channelId}:${userId}` -> [{role:'user'|'model', text}]
 const skFromInteraction = (i) => `${i.channelId}:${i.user.id}`;
 const skFromMessage     = (m) => `${m.channelId}:${m.author.id}`;
@@ -175,7 +169,6 @@ function pushUserTurn(sk, role, text) {
   userMemory.set(sk, h.slice(-MAX_TURNS_PRIVATE));
 }
 
-// Wspólna per kanał – z metadanymi mówcy
 const sharedMemory = new Map(); // channelId -> [{speaker, text}]
 function getSharedHist(channelId) {
   if (!sharedMemory.has(channelId)) sharedMemory.set(channelId, []);
@@ -187,20 +180,14 @@ function pushSharedTurn(channelId, speaker, text) {
   sharedMemory.set(channelId, h.slice(-MAX_TURNS_SHARED));
 }
 
-// Skrót rozmowy per sesja (lekki tekst)
 const sessionSummary = new Map(); // sk -> string
+const sessionCache = new Map();   // sk -> { name, createdAt }
 
-// Cache name per sesja
-const sessionCache = new Map(); // sk -> { name, createdAt }
-
-/* Szacowanie tokenów „na oko” */
 const roughTokens = (s) => Math.ceil((s || '').length / 4);
 
-/* Buduje skrót, gdy historia rośnie */
 async function summarizeIfNeeded(sk, channelId) {
   const priv = getUserHist(sk);
   const shared = getSharedHist(channelId);
-
   const privText = priv.map(t => `${t.role}: ${t.text}`).join('\n');
   const sharedText = shared.map(t => `[@${t.speaker}]: ${t.text}`).join('\n');
   const combined = `${privText}\n---\n${sharedText}`;
@@ -228,7 +215,6 @@ ${sharedText.slice(-4000)}
     const summary = (res.text || '').slice(0, 4000);
     if (summary) sessionSummary.set(sk, summary);
 
-    // przytnij surową pamięć po streszczeniu (zostaw 4 najnowsze tury)
     const tail = priv.slice(-4);
     userMemory.set(sk, tail);
   } catch (e) {
@@ -236,21 +222,19 @@ ${sharedText.slice(-4000)}
   }
 }
 
-/* Tworzy/uzupełnia cache: persona + skrót sesji, z failoverem i dwoma kształtami API */
+/* Cache: tylko skrót (BEZ PERSONY) */
 async function ensureSessionCache(sk) {
   const existing = sessionCache.get(sk);
   if (existing && (Date.now() - existing.createdAt) / 1000 < CACHE_TTL_SEC) {
-    return existing.name; // świeży
+    return existing.name;
   }
   const summaryText = sessionSummary.get(sk) || '';
-
-  // shape A: { config: { systemInstruction, contents, ttl: "3600s" } }
+  // shape A
   try {
     const cache = await gemini.call(
       (c) => c.caches.create({
         model: MODEL,
         config: {
-          systemInstruction: PERSONA,
           contents: summaryText ? [{ role: 'user', parts: [{ text: summaryText }]}] : [],
           ttl: `${CACHE_TTL_SEC}s`,
         },
@@ -260,7 +244,7 @@ async function ensureSessionCache(sk) {
     sessionCache.set(sk, { name: cache.name, createdAt: Date.now() });
     return cache.name;
   } catch (eA) {
-    // shape B: { contents, ttlSeconds }
+    // shape B
     try {
       const cache = await gemini.call(
         (c) => c.caches.create({
@@ -410,22 +394,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
     try {
       const nick = userNickFromInteraction(interaction);
 
-      // zapisz do pamięci
       pushUserTurn(sk, 'user', userPrompt);
       pushSharedTurn(channelId, nick, userPrompt);
 
-      // skróć jeśli trzeba + przygotuj cache
       await summarizeIfNeeded(sk, channelId);
       const cacheName = await ensureSessionCache(sk);
 
-      // zbuduj małe okno
       const contents = toWindowedContents(sk, channelId, nick);
 
-      // config tylko z cache + ewentualnie tools
       const tools = buildToolsFromEnv();
       const genCfg = {
         ...(cacheName ? { cachedContent: cacheName } : {}),
-        ...(tools.length ? { tools } : {})
+        ...(tools.length ? { tools } : {}),
+        // PERSONA zawsze dołączona:
+        systemInstruction: PERSONA,
+        system_instruction: PERSONA, // dla niektórych wariantów/SDK
       };
 
       const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
@@ -447,7 +430,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
         if (!accum) accum = '∅';
 
-        // zapisz odpowiedź
         pushUserTurn(sk, 'model', accum);
         pushSharedTurn(channelId, 'Ricky', accum);
 
@@ -524,7 +506,9 @@ client.on(Events.MessageCreate, async (msg) => {
     const tools = buildToolsFromEnv();
     const genCfg = {
       ...(cacheName ? { cachedContent: cacheName } : {}),
-      ...(tools.length ? { tools } : {})
+      ...(tools.length ? { tools } : {}),
+      systemInstruction: PERSONA,
+      system_instruction: PERSONA,
     };
 
     const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
