@@ -31,10 +31,30 @@ if (!GEMINI_API_KEY) {
 }
 
 /* =========================
-   Gemini SDK & config
+   Gemini SDK & config helpers
    ========================= */
 const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+function buildToolsFromEnv() {
+  const tools = [];
+  if ((process.env.GEMINI_SEARCH || 'off').toLowerCase() === 'on') {
+    tools.push({ googleSearch: {} });   // wyszukiwanie w sieci (grounding)
+  }
+  if ((process.env.GEMINI_URL_CONTEXT || 'off').toLowerCase() === 'on') {
+    tools.push({ urlContext: {} });     // czytanie wskazanych URL-i
+  }
+  return tools;
+}
+
+function buildConfig() {
+  const tools = buildToolsFromEnv();
+  return {
+    systemInstruction: SYS_PROMPT,
+    temperature: 0.5,
+    ...(tools.length ? { tools } : {})
+  };
+}
 
 /* =========================
    Slash commands (auto-register)
@@ -76,7 +96,7 @@ const client = new Client({
 
 // prosta pamięć kontekstu per kanał
 const memory = new Map(); // channelId -> [{ role: 'user'|'model', text }]
-const SYS_PROMPT = `Jesteś wrednym asystentem na Discordzie. Odpowiadaj obrazliwie i z przeklenstwami jak w CHlopakach z Barakow. Jak postać Rick, ale odpisuj max jednym zdaniem`;
+const SYS_PROMPT = `Jesteś asystentem na Discordzie. Odpowiadaj obrazliwie i z przeklenstwami jak w CHlopakach z Barakow. Jak postać Rick, ale odpisuj max jednym zdaniem. Czasem staraj się być pomocny.`
 
 function getHistory(channelId) {
   if (!memory.has(channelId)) memory.set(channelId, []);
@@ -109,6 +129,32 @@ function chunkForDiscord(text, limit = 2000) {
     i += limit;
   }
   return chunks;
+}
+
+/* =========================
+   Źródła (cytowania) z odpowiedzi Gemini
+   ========================= */
+function collectSourcesFromPiece(piece, set) {
+  try {
+    const cand = piece?.candidates?.[0];
+    const gmeta = cand?.groundingMetadata;
+    const chunks = gmeta?.groundingChunks ?? [];
+    for (const ch of chunks) {
+      const uri = ch?.web?.uri;
+      if (uri) set.add(uri);
+    }
+    const urlMeta = cand?.urlContextMetadata?.urlMetadata ?? [];
+    for (const m of urlMeta) {
+      const u = m?.retrieved_url;
+      if (u) set.add(u);
+    }
+  } catch { /* ignore */ }
+}
+
+function sourcesFooterFromSet(sourcesSet) {
+  const list = [...sourcesSet].slice(0, 5);
+  if (!list.length) return '';
+  return "\n\nŹródła:\n" + list.map((u, i) => `${i + 1}. ${u}`).join("\n");
 }
 
 /* =========================
@@ -159,153 +205,4 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   if (interaction.commandName === 'gemini-reset') {
     memory.delete(channelId);
-    await interaction.reply({ content: '🧹 Kontekst w tym kanale wyczyszczony.', ephemeral: true });
-    return;
-  }
-
-  if (interaction.commandName === 'gemini') {
-    const userPrompt = interaction.options.getString('prompt', true);
-    const ephemeral = interaction.options.getBoolean('ephemeral') ?? false;
-
-    // ephemeral trzeba ustawić już przy deferReply
-    await interaction.deferReply({ ephemeral });
-
-    try {
-      pushTurn(channelId, 'user', userPrompt);
-
-      const contents = toGeminiContents(channelId);
-      const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
-      const config = { systemInstruction: SYS_PROMPT, temperature: 0.5 };
-
-      if (useStream) {
-        const response = await ai.models.generateContentStream({ model: MODEL, contents, config });
-
-        let accum = '';
-        let lastEdit = Date.now();
-
-        for await (const chunk of response) {
-          accum += (chunk.text ?? '');
-          const now = Date.now();
-          if (now - lastEdit > 600) {
-            const toShow = accum.slice(0, 1900);
-            await interaction.editReply(toShow || '⏳ …');
-            lastEdit = now;
-          }
-        }
-
-        if (!accum) accum = '∅';
-        pushTurn(channelId, 'model', accum);
-
-        const chunks = chunkForDiscord(accum);
-        if (chunks.length === 1) {
-          await interaction.editReply(chunks[0]);
-        } else {
-          await interaction.editReply(chunks[0] + '\n\n*(odpowiedź była długa — wysyłam resztę w kolejnych wiadomościach)*');
-          for (let i = 1; i < chunks.length; i++) {
-            await interaction.followUp({ content: chunks[i], ephemeral });
-          }
-        }
-      } else {
-        const response = await ai.models.generateContent({ model: MODEL, contents, config });
-        const answer = response.text ?? '(brak treści)';
-        pushTurn(channelId, 'model', answer);
-
-        const chunks = chunkForDiscord(answer);
-        await interaction.editReply(chunks[0]);
-        for (let i = 1; i < chunks.length; i++) {
-          await interaction.followUp({ content: chunks[i], ephemeral });
-        }
-      }
-    } catch (err) {
-      console.error(err);
-      await interaction.editReply(`❌ Błąd: ${String(err.message || err)}`);
-    }
-  }
-});
-
-/* =========================
-   Message-based trigger ("gemini ..." or @mention)
-   ========================= */
-client.on(Events.MessageCreate, async (msg) => {
-  try {
-    if (msg.author.bot) return; // ignoruj boty
-    if (!client.user) return;   // jeszcze nie gotowy
-
-    const raw = (msg.content || '').trim();
-    if (!raw) return;
-
-    const mention = new RegExp(`^<@!?${client.user.id}>`);
-    const startsWithMention = mention.test(raw);
-    const startsWithGemini = raw.toLowerCase().startsWith('gemini');
-
-    if (!startsWithMention && !startsWithGemini) return;
-
-    // wytnij prefix i pobierz prompt
-    let prompt = raw;
-    if (startsWithGemini) {
-      prompt = prompt.slice('gemini'.length);
-    } else if (startsWithMention) {
-      prompt = prompt.replace(mention, '');
-    }
-    prompt = prompt.replace(/^[:\-\s]+/, '').trim();
-
-    if (!prompt) {
-      await msg.reply('Podaj treść po `gemini` (np. `gemini jak działa kubernetes?`).');
-      return;
-    }
-
-    await msg.channel.sendTyping();
-
-    const channelId = msg.channelId;
-    pushTurn(channelId, 'user', prompt);
-
-    const contents = toGeminiContents(channelId);
-    const config = { systemInstruction: SYS_PROMPT, temperature: 0.5 };
-    const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
-
-    if (useStream) {
-      const stream = await ai.models.generateContentStream({ model: MODEL, contents, config });
-      let accum = '';
-      let lastEdit = Date.now();
-
-      const replyMsg = await msg.reply('⏳ …');
-
-      for await (const chunk of stream) {
-        accum += (chunk.text ?? '');
-        if (Date.now() - lastEdit > 900) {
-          await replyMsg.edit(accum.slice(0, 2000));
-          lastEdit = Date.now();
-        }
-      }
-
-      if (!accum) accum = '∅';
-      pushTurn(channelId, 'model', accum);
-
-      if (accum.length <= 2000) {
-        await replyMsg.edit(accum);
-      } else {
-        await replyMsg.edit(accum.slice(0, 2000));
-        const chunks = chunkForDiscord(accum).slice(1);
-        for (const ch of chunks) await msg.channel.send({ content: ch });
-      }
-    } else {
-      const res = await ai.models.generateContent({ model: MODEL, contents, config });
-      const answer = res.text ?? '(brak treści)';
-      pushTurn(channelId, 'model', answer);
-
-      const chunks = chunkForDiscord(answer);
-      await msg.reply(chunks[0]);
-      for (let i = 1; i < chunks.length; i++) {
-        await msg.channel.send({ content: chunks[i] });
-      }
-    }
-  } catch (e) {
-    console.error(e);
-    try { await msg.reply('❌ Błąd: ' + (e.message || e)); } catch {}
-  }
-});
-
-/* =========================
-   Start
-   ========================= */
-client.login(DISCORD_TOKEN);
+    await interaction.reply({ cont
