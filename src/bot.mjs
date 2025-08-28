@@ -12,6 +12,12 @@ import {
 import { GoogleGenAI } from '@google/genai';
 
 /* =========================
+   Prefiksy i utilsy
+   ========================= */
+// reaguj na te prefiksy (case-insensitive)
+const PREFIXES = ['gemini', 'ricky', 'rick'];
+
+/* =========================
    Preflight ENV checks
    ========================= */
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -39,7 +45,6 @@ function flag(name, def = false) {
   if (!clean) return def;
   return /^(1|true|t|on|yes|y)$/i.test(clean);
 }
-
 function userNickFromInteraction(interaction) {
   return (
     interaction.member?.nickname ||
@@ -49,7 +54,6 @@ function userNickFromInteraction(interaction) {
     'Użytkownik'
   );
 }
-
 function userNickFromMessage(msg) {
   return (
     msg.member?.displayName ||
@@ -67,8 +71,8 @@ const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
 function buildToolsFromEnv() {
   const tools = [];
-  if (flag('GEMINI_SEARCH')) tools.push({ googleSearch: {} });
-  if (flag('GEMINI_URL_CONTEXT')) tools.push({ urlContext: {} });
+  if (flag('GEMINI_SEARCH')) tools.push({ googleSearch: {} }); // włącz wyszukiwarkę
+  if (flag('GEMINI_URL_CONTEXT')) tools.push({ urlContext: {} }); // czytanie URL-i
   return tools;
 }
 
@@ -123,7 +127,6 @@ const client = new Client({
 
 // prosta pamięć kontekstu per kanał
 const memory = new Map(); // channelId -> [{ role: 'user'|'model', text }]
-
 function getHistory(channelId) {
   if (!memory.has(channelId)) memory.set(channelId, []);
   return memory.get(channelId);
@@ -161,7 +164,6 @@ async function setBotNicknameInGuild(guild) {
     await guild.members.me.setNickname('Ricky');
     console.log(`📝 Ustawiono nick "Ricky" w ${guild.name} (${guild.id})`);
   } catch (e) {
-    // Brak uprawnień/hierarchia — pomiń, ale zaloguj
     console.warn(`⚠️ Nie udało się ustawić nicku w ${guild.name} (${guild.id}):`, e?.message || e);
   }
 }
@@ -175,7 +177,6 @@ client.once(Events.ClientReady, async (c) => {
     const appId = c.application.id;
 
     for (const [, guild] of c.guilds.cache) {
-      // rejestruj komendy per-guild
       try {
         await rest.put(
           Routes.applicationGuildCommands(appId, guild.id),
@@ -185,7 +186,6 @@ client.once(Events.ClientReady, async (c) => {
       } catch (e) {
         console.error(`❌ Rejestracja komend w ${guild?.name || guild?.id}:`, e);
       }
-      // ustaw nick
       await setBotNicknameInGuild(guild);
     }
   } catch (e) {
@@ -280,7 +280,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 /* =========================
-   Message-based trigger ("gemini ..." or @mention)
+   Message-based trigger (prefiksy + @mention)
    ========================= */
 client.on(Events.MessageCreate, async (msg) => {
   try {
@@ -292,21 +292,24 @@ client.on(Events.MessageCreate, async (msg) => {
 
     const mention = new RegExp(`^<@!?${client.user.id}>`);
     const startsWithMention = mention.test(raw);
-    const startsWithGemini = raw.toLowerCase().startsWith('gemini');
 
-    if (!startsWithMention && !startsWithGemini) return;
+    const lower = raw.toLowerCase();
+    const matchedPrefix = PREFIXES.find(p => lower.startsWith(p));
 
-    // wytnij prefix i pobierz prompt
+    if (!startsWithMention && !matchedPrefix) return;
+
+    // wytnij znaleziony prefiks albo wzmiankę i przygotuj prompt
     let prompt = raw;
-    if (startsWithGemini) {
-      prompt = prompt.slice('gemini'.length);
+    if (matchedPrefix) {
+      prompt = raw.slice(matchedPrefix.length);
     } else if (startsWithMention) {
-      prompt = prompt.replace(mention, '');
+      prompt = raw.replace(mention, '');
     }
-    prompt = prompt.replace(/^[:\-\s]+/, '').trim();
+    // usuń interpunkcję/spacje po prefiksie/zmianie
+    prompt = prompt.replace(/^[:\-–—,.\s]+/, '').trim();
 
     if (!prompt) {
-      await msg.reply('Podaj treść po `gemini` (np. `gemini jak działa kubernetes?`).');
+      await msg.reply('Podaj treść po prefiksie (gemini/ricky/rick) lub po wzmiance, np. `ricky co to jest vector DB?`');
       return;
     }
 
