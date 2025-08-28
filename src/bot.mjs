@@ -96,7 +96,7 @@ const client = new Client({
 
 // prosta pamięć kontekstu per kanał
 const memory = new Map(); // channelId -> [{ role: 'user'|'model', text }]
-const SYS_PROMPT = `Jesteś asystentem na Discordzie. Odpowiadaj obrazliwie i z przeklenstwami jak w CHlopakach z Barakow. Jak postać Rick, ale odpisuj max jednym zdaniem. Czasem staraj się być pomocny.`
+const SYS_PROMPT = `Jesteś asystentem na Discordzie. Odpowiadaj obrazliwie i z przeklenstwami jak w CHlopakach z Barakow. Jak postać Rick, ale odpisuj max jednym zdaniem. Czasem staraj się być pomocny.`;
 
 function getHistory(channelId) {
   if (!memory.has(channelId)) memory.set(channelId, []);
@@ -205,4 +205,181 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
   if (interaction.commandName === 'gemini-reset') {
     memory.delete(channelId);
-    await interaction.reply({ cont
+    await interaction.reply({ content: '🧹 Kontekst w tym kanale wyczyszczony.', ephemeral: true });
+    return;
+  }
+
+  if (interaction.commandName === 'gemini') {
+    const userPrompt = interaction.options.getString('prompt', true);
+    const ephemeral = interaction.options.getBoolean('ephemeral') ?? false;
+    await interaction.deferReply({ ephemeral });
+
+    try {
+      pushTurn(channelId, 'user', userPrompt);
+
+      const contents = toGeminiContents(channelId);
+      const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
+      const config = buildConfig();
+
+      if (useStream) {
+        const stream = await ai.models.generateContentStream({ model: MODEL, contents, config });
+
+        let accum = '';
+        let lastEdit = Date.now();
+        const sourcesSet = new Set();
+
+        // Pierwsza szybka odpowiedź, żeby nie było ciszy
+        const replyMsg = await interaction.editReply('⏳ …');
+
+        for await (const chunk of stream) {
+          // text
+          accum += (chunk.text ?? '');
+
+          // metadane źródeł (jeśli są w chunku)
+          collectSourcesFromPiece(chunk, sourcesSet);
+
+          // throttling edycji
+          const now = Date.now();
+          if (now - lastEdit > 600) {
+            await interaction.editReply(accum.slice(0, 1900) || '⏳ …');
+            lastEdit = now;
+          }
+        }
+
+        // dopnij źródła (jeśli są)
+        const footer = sourcesFooterFromSet(sourcesSet);
+        let finalText = accum + footer;
+
+        if (!finalText) finalText = '∅';
+        pushTurn(channelId, 'model', finalText);
+
+        const chunks = chunkForDiscord(finalText);
+        if (chunks.length === 1) {
+          await interaction.editReply(chunks[0]);
+        } else {
+          await interaction.editReply(chunks[0] + '\n\n*(odpowiedź była długa — wysyłam resztę w kolejnych wiadomościach)*');
+          for (let i = 1; i < chunks.length; i++) {
+            await interaction.followUp({ content: chunks[i], ephemeral });
+          }
+        }
+      } else {
+        const response = await ai.models.generateContent({ model: MODEL, contents, config });
+        let answer = response.text ?? '(brak treści)';
+
+        // dopnij źródła (z pełnej odpowiedzi)
+        const sourcesSet = new Set();
+        collectSourcesFromPiece(response, sourcesSet);
+        answer += sourcesFooterFromSet(sourcesSet);
+
+        pushTurn(channelId, 'model', answer);
+
+        const chunks = chunkForDiscord(answer);
+        await interaction.editReply(chunks[0]);
+        for (let i = 1; i < chunks.length; i++) {
+          await interaction.followUp({ content: chunks[i], ephemeral });
+        }
+      }
+    } catch (err) {
+      console.error(err);
+      await interaction.editReply(`❌ Błąd: ${String(err.message || err)}`);
+    }
+  }
+});
+
+/* =========================
+   Message-based trigger ("gemini ..." or @mention)
+   ========================= */
+client.on(Events.MessageCreate, async (msg) => {
+  try {
+    if (msg.author.bot) return; // ignoruj boty
+    if (!client.user) return;   // jeszcze nie gotowy
+
+    const raw = (msg.content || '').trim();
+    if (!raw) return;
+
+    const mention = new RegExp(`^<@!?${client.user.id}>`);
+    const startsWithMention = mention.test(raw);
+    const startsWithGemini = raw.toLowerCase().startsWith('gemini');
+
+    if (!startsWithMention && !startsWithGemini) return;
+
+    // wytnij prefix i pobierz prompt
+    let prompt = raw;
+    if (startsWithGemini) {
+      prompt = prompt.slice('gemini'.length);
+    } else if (startsWithMention) {
+      prompt = prompt.replace(mention, '');
+    }
+    prompt = prompt.replace(/^[:\-\s]+/, '').trim();
+
+    if (!prompt) {
+      await msg.reply('Podaj treść po `gemini` (np. `gemini jak działa kubernetes?`).');
+      return;
+    }
+
+    await msg.channel.sendTyping();
+
+    const channelId = msg.channelId;
+    pushTurn(channelId, 'user', prompt);
+
+    const contents = toGeminiContents(channelId);
+    const config = buildConfig();
+    const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
+
+    if (useStream) {
+      const stream = await ai.models.generateContentStream({ model: MODEL, contents, config });
+      let accum = '';
+      let lastEdit = Date.now();
+      const sourcesSet = new Set();
+
+      const replyMsg = await msg.reply('⏳ …');
+
+      for await (const chunk of stream) {
+        accum += (chunk.text ?? '');
+        collectSourcesFromPiece(chunk, sourcesSet);
+
+        if (Date.now() - lastEdit > 900) {
+          await replyMsg.edit(accum.slice(0, 2000));
+          lastEdit = Date.now();
+        }
+      }
+
+      // dopnij źródła i wyślij final
+      const footer = sourcesFooterFromSet(sourcesSet);
+      let finalText = accum + footer;
+      if (!finalText) finalText = '∅';
+      pushTurn(channelId, 'model', finalText);
+
+      if (finalText.length <= 2000) {
+        await replyMsg.edit(finalText);
+      } else {
+        await replyMsg.edit(finalText.slice(0, 2000));
+        const chunks = chunkForDiscord(finalText).slice(1);
+        for (const ch of chunks) await msg.channel.send({ content: ch });
+      }
+    } else {
+      const res = await ai.models.generateContent({ model: MODEL, contents, config });
+      let answer = res.text ?? '(brak treści)';
+
+      const sourcesSet = new Set();
+      collectSourcesFromPiece(res, sourcesSet);
+      answer += sourcesFooterFromSet(sourcesSet);
+
+      pushTurn(channelId, 'model', answer);
+
+      const chunks = chunkForDiscord(answer);
+      await msg.reply(chunks[0]);
+      for (let i = 1; i < chunks.length; i++) {
+        await msg.channel.send({ content: chunks[i] });
+      }
+    }
+  } catch (e) {
+    console.error(e);
+    try { await msg.reply('❌ Błąd: ' + (e.message || e)); } catch {}
+  }
+});
+
+/* =========================
+   Start
+   ========================= */
+client.login(DISCORD_TOKEN);
