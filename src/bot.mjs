@@ -76,7 +76,7 @@ function buildToolsFromEnv() {
   return tools;
 }
 
-const SYS_PROMPT = `Jesteś asystentem na Discordzie. Odpowiadaj obrazliwie i z przeklenstwami jak w CHlopakach z Barakow. Jak postać Rick, ale odpisuj max jednym zdaniem. Czasem staraj się być pomocny. Nie myl nickow (imion) rozmowcow, pamietaj kontekst rozmowcy`
+const SYS_PROMPT = `Jesteś asystentem na Discordzie. Odpowiadaj obrazliwie i z przeklenstwami jak w CHlopakach z Barakow. Jak postać Rick, ale odpisuj max jednym zdaniem. Czasem staraj się być pomocny. Nie myl nickow (imion) rozmowcow, pamietaj kontekst rozmowcy`;
 function buildConfig(userNick) {
   const tools = buildToolsFromEnv();
   const systemInstruction = `${SYS_PROMPT}\nRozmawiasz teraz z : ${userNick}`;
@@ -106,7 +106,7 @@ const commands = [
     .toJSON(),
   new SlashCommandBuilder()
     .setName('gemini-reset')
-    .setDescription('Wyczyść kontekst rozmowy w tym kanale')
+    .setDescription('Wyczyść **twój** kontekst rozmowy w tym kanale')
     .toJSON()
 ];
 
@@ -125,20 +125,29 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-// prosta pamięć kontekstu per kanał
-const memory = new Map(); // channelId -> [{ role: 'user'|'model', text }]
-function getHistory(channelId) {
-  if (!memory.has(channelId)) memory.set(channelId, []);
-  return memory.get(channelId);
+/* =========================
+   Pamięć per SESJA (kanał + użytkownik)
+   ========================= */
+const memory = new Map(); // sessionKey -> [{ role: 'user'|'model', text }]
+
+// klucze sesji
+const sessionKeyFromInteraction = (interaction) =>
+  `${interaction.channelId}:${interaction.user.id}`;
+const sessionKeyFromMessage = (msg) =>
+  `${msg.channelId}:${msg.author.id}`;
+
+function getHistory(sessionKey) {
+  if (!memory.has(sessionKey)) memory.set(sessionKey, []);
+  return memory.get(sessionKey);
 }
-function pushTurn(channelId, role, text, maxTurns = 12) {
-  const hist = getHistory(channelId);
+function pushTurn(sessionKey, role, text, maxTurns = 12) {
+  const hist = getHistory(sessionKey);
   hist.push({ role, text });
   const tail = hist.slice(-maxTurns);
-  memory.set(channelId, tail);
+  memory.set(sessionKey, tail);
 }
-function toGeminiContents(channelId) {
-  const hist = getHistory(channelId);
+function toGeminiContents(sessionKey) {
+  const hist = getHistory(sessionKey);
   return hist.map(m => ({
     role: m.role === 'model' ? 'model' : 'user',
     parts: [{ text: m.text }]
@@ -213,11 +222,12 @@ client.on('guildCreate', async (guild) => {
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  const channelId = interaction.channelId;
+  // klucz sesji: kanał + użytkownik
+  const sk = sessionKeyFromInteraction(interaction);
 
   if (interaction.commandName === 'gemini-reset') {
-    memory.delete(channelId);
-    await interaction.reply({ content: '🧹 Kontekst w tym kanale wyczyszczony.', ephemeral: true });
+    memory.delete(sk);
+    await interaction.reply({ content: '🧹 Twój kontekst w tym kanale wyczyszczony.', ephemeral: true });
     return;
   }
 
@@ -227,9 +237,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await interaction.deferReply({ ephemeral });
 
     try {
-      pushTurn(channelId, 'user', userPrompt);
+      pushTurn(sk, 'user', userPrompt);
 
-      const contents = toGeminiContents(channelId);
+      const contents = toGeminiContents(sk);
       const userNick = userNickFromInteraction(interaction);
       const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
       const config = buildConfig(userNick);
@@ -250,7 +260,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         if (!accum) accum = '∅';
-        pushTurn(channelId, 'model', accum);
+        pushTurn(sk, 'model', accum);
 
         const chunks = chunkForDiscord(accum);
         if (chunks.length === 1) {
@@ -264,7 +274,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       } else {
         const response = await ai.models.generateContent({ model: MODEL, contents, config });
         const answer = response.text ?? '(brak treści)';
-        pushTurn(channelId, 'model', answer);
+        pushTurn(sk, 'model', answer);
 
         const chunks = chunkForDiscord(answer);
         await interaction.editReply(chunks[0]);
@@ -315,10 +325,12 @@ client.on(Events.MessageCreate, async (msg) => {
 
     await msg.channel.sendTyping();
 
-    const channelId = msg.channelId;
-    pushTurn(channelId, 'user', prompt);
+    // klucz sesji: kanał + autor wiadomości
+    const sk = sessionKeyFromMessage(msg);
 
-    const contents = toGeminiContents(channelId);
+    pushTurn(sk, 'user', prompt);
+
+    const contents = toGeminiContents(sk);
     const userNick = userNickFromMessage(msg);
     const config = buildConfig(userNick);
     const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
@@ -339,7 +351,7 @@ client.on(Events.MessageCreate, async (msg) => {
       }
 
       if (!accum) accum = '∅';
-      pushTurn(channelId, 'model', accum);
+      pushTurn(sk, 'model', accum);
 
       if (accum.length <= 2000) {
         await replyMsg.edit(accum);
@@ -351,7 +363,7 @@ client.on(Events.MessageCreate, async (msg) => {
     } else {
       const res = await ai.models.generateContent({ model: MODEL, contents, config });
       const answer = res.text ?? '(brak treści)';
-      pushTurn(channelId, 'model', answer);
+      pushTurn(sk, 'model', answer);
 
       const chunks = chunkForDiscord(answer);
       await msg.reply(chunks[0]);
