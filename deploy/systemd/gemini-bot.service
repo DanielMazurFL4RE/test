@@ -1,0 +1,17 @@
+[Unit]
+Description=Gemini Discord Bot
+After=network.target
+
+[Service]
+Type=simple
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/gemini-discord-bot/.env
+WorkingDirectory=/opt/gemini-discord-bot
+ExecStart=/usr/bin/node src/bot.mjs
+Restart=always
+RestartSec=5
+User=bot
+Group=bot
+
+[Install]
+WantedBy=multi-user.target

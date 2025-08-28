@@ -1,0 +1,19 @@
+{
+  "name": "gemini-discord-bot",
+  "version": "1.0.2",
+  "type": "module",
+  "main": "src/bot.mjs",
+  "scripts": {
+    "start": "node src/bot.mjs",
+    "dev": "node --watch src/bot.mjs",
+    "deploy": "node scripts/deploy-commands.mjs"
+  },
+  "engines": {
+    "node": ">=20.6"
+  },
+  "dependencies": {
+    "@google/genai": "^1.16.0",
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5"
+  }
+}
