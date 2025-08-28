@@ -11,7 +11,9 @@ import {
 } from 'discord.js';
 import { GoogleGenAI } from '@google/genai';
 
-// === Preflight ENV checks (czytelne błędy zamiast TokenInvalid) ===
+/* =========================
+   Preflight ENV checks
+   ========================= */
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 if (!DISCORD_TOKEN) {
   console.error('❌ Brak DISCORD_TOKEN w zmiennych środowiskowych.');
@@ -28,11 +30,15 @@ if (!GEMINI_API_KEY) {
   process.exit(1);
 }
 
-// === Model i SDK Gemini ===
+/* =========================
+   Gemini SDK & config
+   ========================= */
 const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-// === Definicje slash-commands (rejestrowane automatycznie) ===
+/* =========================
+   Slash commands (auto-register)
+   ========================= */
 const commands = [
   new SlashCommandBuilder()
     .setName('gemini')
@@ -55,15 +61,22 @@ const commands = [
 
 const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 
-// === Klient Discord ===
+/* =========================
+   Discord client
+   ========================= */
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
-  partials: [Partials.Channel],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,   // czytanie wiadomości na serwerach
+    GatewayIntentBits.MessageContent,  // treść wiadomości (włącz w Developer Portal)
+    GatewayIntentBits.DirectMessages   // DM-y
+  ],
+  partials: [Partials.Channel] // dla DM-ów i ewentualnych partials
 });
 
 // prosta pamięć kontekstu per kanał
 const memory = new Map(); // channelId -> [{ role: 'user'|'model', text }]
-const SYS_PROMPT = `Jesteś wrednym asystentem na Discordzie. Odpowiadaj zwięźle i jasno w stylu serialu Chłopaki z Baraków.`;
+const SYS_PROMPT = `Jesteś wrednym asystentem na Discordzie. Odpowiadaj obrazliwie i z przeklenstwami jak w CHlopakach z Barakow.`;
 
 function getHistory(channelId) {
   if (!memory.has(channelId)) memory.set(channelId, []);
@@ -98,7 +111,9 @@ function chunkForDiscord(text, limit = 2000) {
   return chunks;
 }
 
-// === Auto-rejestracja komend po starcie (dla wszystkich gildii, w których bot już jest) ===
+/* =========================
+   Auto-register commands
+   ========================= */
 client.once(Events.ClientReady, async (c) => {
   console.log(`Zalogowano jako ${c.user.tag}`);
   try {
@@ -121,7 +136,6 @@ client.once(Events.ClientReady, async (c) => {
   }
 });
 
-// === Auto-rejestracja komend przy dołączeniu do nowej gildii ===
 client.on('guildCreate', async (guild) => {
   try {
     await client.application?.fetch();
@@ -135,7 +149,9 @@ client.on('guildCreate', async (guild) => {
   }
 });
 
-// === Obsługa komend ===
+/* =========================
+   Slash commands handling
+   ========================= */
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
@@ -159,19 +175,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       const contents = toGeminiContents(channelId);
       const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
-
-      // konfiguracja: system instruction + temperatura
-      const config = {
-        systemInstruction: SYS_PROMPT,
-        temperature: 0.5
-      };
+      const config = { systemInstruction: SYS_PROMPT, temperature: 0.5 };
 
       if (useStream) {
-        const response = await ai.models.generateContentStream({
-          model: MODEL,
-          contents,
-          config
-        });
+        const response = await ai.models.generateContentStream({ model: MODEL, contents, config });
 
         let accum = '';
         let lastEdit = Date.now();
@@ -199,12 +206,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
         }
       } else {
-        const response = await ai.models.generateContent({
-          model: MODEL,
-          contents,
-          config
-        });
-
+        const response = await ai.models.generateContent({ model: MODEL, contents, config });
         const answer = response.text ?? '(brak treści)';
         pushTurn(channelId, 'model', answer);
 
@@ -221,5 +223,89 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-// === Start ===
+/* =========================
+   Message-based trigger ("gemini ..." or @mention)
+   ========================= */
+client.on(Events.MessageCreate, async (msg) => {
+  try {
+    if (msg.author.bot) return; // ignoruj boty
+    if (!client.user) return;   // jeszcze nie gotowy
+
+    const raw = (msg.content || '').trim();
+    if (!raw) return;
+
+    const mention = new RegExp(`^<@!?${client.user.id}>`);
+    const startsWithMention = mention.test(raw);
+    const startsWithGemini = raw.toLowerCase().startsWith('gemini');
+
+    if (!startsWithMention && !startsWithGemini) return;
+
+    // wytnij prefix i pobierz prompt
+    let prompt = raw;
+    if (startsWithGemini) {
+      prompt = prompt.slice('gemini'.length);
+    } else if (startsWithMention) {
+      prompt = prompt.replace(mention, '');
+    }
+    prompt = prompt.replace(/^[:\-\s]+/, '').trim();
+
+    if (!prompt) {
+      await msg.reply('Podaj treść po `gemini` (np. `gemini jak działa kubernetes?`).');
+      return;
+    }
+
+    await msg.channel.sendTyping();
+
+    const channelId = msg.channelId;
+    pushTurn(channelId, 'user', prompt);
+
+    const contents = toGeminiContents(channelId);
+    const config = { systemInstruction: SYS_PROMPT, temperature: 0.5 };
+    const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
+
+    if (useStream) {
+      const stream = await ai.models.generateContentStream({ model: MODEL, contents, config });
+      let accum = '';
+      let lastEdit = Date.now();
+
+      const replyMsg = await msg.reply('⏳ …');
+
+      for await (const chunk of stream) {
+        accum += (chunk.text ?? '');
+        if (Date.now() - lastEdit > 900) {
+          await replyMsg.edit(accum.slice(0, 2000));
+          lastEdit = Date.now();
+        }
+      }
+
+      if (!accum) accum = '∅';
+      pushTurn(channelId, 'model', accum);
+
+      if (accum.length <= 2000) {
+        await replyMsg.edit(accum);
+      } else {
+        await replyMsg.edit(accum.slice(0, 2000));
+        const chunks = chunkForDiscord(accum).slice(1);
+        for (const ch of chunks) await msg.channel.send({ content: ch });
+      }
+    } else {
+      const res = await ai.models.generateContent({ model: MODEL, contents, config });
+      const answer = res.text ?? '(brak treści)';
+      pushTurn(channelId, 'model', answer);
+
+      const chunks = chunkForDiscord(answer);
+      await msg.reply(chunks[0]);
+      for (let i = 1; i < chunks.length; i++) {
+        await msg.channel.send({ content: chunks[i] });
+      }
+    }
+  } catch (e) {
+    console.error(e);
+    try { await msg.reply('❌ Błąd: ' + (e.message || e)); } catch {}
+  }
+});
+
+/* =========================
+   Start
+   ========================= */
 client.login(DISCORD_TOKEN);
