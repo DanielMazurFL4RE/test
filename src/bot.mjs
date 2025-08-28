@@ -31,26 +31,53 @@ if (!GEMINI_API_KEY) {
 }
 
 /* =========================
-   Gemini SDK & config helpers
+   Helpers (flagi, nicki)
+   ========================= */
+function flag(name, def = false) {
+  const raw = (process.env[name] ?? '').toString();
+  const clean = raw.split('#')[0].replace(/['"]/g, '').trim();
+  if (!clean) return def;
+  return /^(1|true|t|on|yes|y)$/i.test(clean);
+}
+
+function userNickFromInteraction(interaction) {
+  return (
+    interaction.member?.nickname ||
+    interaction.member?.displayName ||
+    interaction.user?.globalName ||
+    interaction.user?.username ||
+    'Użytkownik'
+  );
+}
+
+function userNickFromMessage(msg) {
+  return (
+    msg.member?.displayName ||
+    msg.author?.globalName ||
+    msg.author?.username ||
+    'Użytkownik'
+  );
+}
+
+/* =========================
+   Gemini SDK & config
    ========================= */
 const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
 function buildToolsFromEnv() {
   const tools = [];
-  if ((process.env.GEMINI_SEARCH || 'off').toLowerCase() === 'on') {
-    tools.push({ googleSearch: {} });   // wyszukiwanie w sieci (grounding)
-  }
-  if ((process.env.GEMINI_URL_CONTEXT || 'off').toLowerCase() === 'on') {
-    tools.push({ urlContext: {} });     // czytanie wskazanych URL-i
-  }
+  if (flag('GEMINI_SEARCH')) tools.push({ googleSearch: {} });
+  if (flag('GEMINI_URL_CONTEXT')) tools.push({ urlContext: {} });
   return tools;
 }
 
-function buildConfig() {
+const SYS_PROMPT = `Jesteś pomocnym asystentem na Discordzie. Odpowiadaj zwięźle i jasno.`;
+function buildConfig(userNick) {
   const tools = buildToolsFromEnv();
+  const systemInstruction = `${SYS_PROMPT}\nAktualny rozmówca (nickname): ${userNick}`;
   return {
-    systemInstruction: SYS_PROMPT,
+    systemInstruction,
     temperature: 0.5,
     ...(tools.length ? { tools } : {})
   };
@@ -87,30 +114,26 @@ const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,   // czytanie wiadomości na serwerach
+    GatewayIntentBits.GuildMessages,   // czytanie wiadomości
     GatewayIntentBits.MessageContent,  // treść wiadomości (włącz w Developer Portal)
     GatewayIntentBits.DirectMessages   // DM-y
   ],
-  partials: [Partials.Channel] // dla DM-ów i ewentualnych partials
+  partials: [Partials.Channel]
 });
 
 // prosta pamięć kontekstu per kanał
 const memory = new Map(); // channelId -> [{ role: 'user'|'model', text }]
-const SYS_PROMPT = `Jesteś asystentem na Discordzie. Odpowiadaj obrazliwie i z przeklenstwami jak w CHlopakach z Barakow. Jak postać Rick, ale odpisuj max jednym zdaniem. Często jednak staraj się być pomocny.`;
 
 function getHistory(channelId) {
   if (!memory.has(channelId)) memory.set(channelId, []);
   return memory.get(channelId);
 }
-
 function pushTurn(channelId, role, text, maxTurns = 12) {
   const hist = getHistory(channelId);
   hist.push({ role, text });
   const tail = hist.slice(-maxTurns);
   memory.set(channelId, tail);
 }
-
-// konwersja naszej historii do formatu "contents" Gemini
 function toGeminiContents(channelId) {
   const hist = getHistory(channelId);
   return hist.map(m => ({
@@ -118,8 +141,6 @@ function toGeminiContents(channelId) {
     parts: [{ text: m.text }]
   }));
 }
-
-// dzielenie długich wiadomości pod limit 2000 znaków Discorda
 function chunkForDiscord(text, limit = 2000) {
   if (text.length <= limit) return [text];
   const chunks = [];
@@ -132,41 +153,29 @@ function chunkForDiscord(text, limit = 2000) {
 }
 
 /* =========================
-   Źródła (cytowania) z odpowiedzi Gemini
+   Auto-register + ustawianie nicku "Ricky"
    ========================= */
-function collectSourcesFromPiece(piece, set) {
+async function setBotNicknameInGuild(guild) {
   try {
-    const cand = piece?.candidates?.[0];
-    const gmeta = cand?.groundingMetadata;
-    const chunks = gmeta?.groundingChunks ?? [];
-    for (const ch of chunks) {
-      const uri = ch?.web?.uri;
-      if (uri) set.add(uri);
-    }
-    const urlMeta = cand?.urlContextMetadata?.urlMetadata ?? [];
-    for (const m of urlMeta) {
-      const u = m?.retrieved_url;
-      if (u) set.add(u);
-    }
-  } catch { /* ignore */ }
+    await guild.members.fetchMe();
+    await guild.members.me.setNickname('Ricky');
+    console.log(`📝 Ustawiono nick "Ricky" w ${guild.name} (${guild.id})`);
+  } catch (e) {
+    // Brak uprawnień/hierarchia — pomiń, ale zaloguj
+    console.warn(`⚠️ Nie udało się ustawić nicku w ${guild.name} (${guild.id}):`, e?.message || e);
+  }
 }
 
-function sourcesFooterFromSet(sourcesSet) {
-  const list = [...sourcesSet].slice(0, 5);
-  if (!list.length) return '';
-  return "\n\nŹródła:\n" + list.map((u, i) => `${i + 1}. ${u}`).join("\n");
-}
-
-/* =========================
-   Auto-register commands
-   ========================= */
 client.once(Events.ClientReady, async (c) => {
   console.log(`Zalogowano jako ${c.user.tag}`);
+  console.log(`[cfg] model=${MODEL} search=${flag('GEMINI_SEARCH')} urlContext=${flag('GEMINI_URL_CONTEXT')}`);
+
   try {
     await c.application?.fetch();
     const appId = c.application.id;
 
     for (const [, guild] of c.guilds.cache) {
+      // rejestruj komendy per-guild
       try {
         await rest.put(
           Routes.applicationGuildCommands(appId, guild.id),
@@ -176,6 +185,8 @@ client.once(Events.ClientReady, async (c) => {
       } catch (e) {
         console.error(`❌ Rejestracja komend w ${guild?.name || guild?.id}:`, e);
       }
+      // ustaw nick
+      await setBotNicknameInGuild(guild);
     }
   } catch (e) {
     console.error('❌ Nie udało się pobrać aplikacji / zarejestrować komend:', e);
@@ -193,6 +204,7 @@ client.on('guildCreate', async (guild) => {
   } catch (e) {
     console.error('❌ Rejestracja komend po join:', e);
   }
+  await setBotNicknameInGuild(guild);
 });
 
 /* =========================
@@ -218,27 +230,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
       pushTurn(channelId, 'user', userPrompt);
 
       const contents = toGeminiContents(channelId);
+      const userNick = userNickFromInteraction(interaction);
       const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
-      const config = buildConfig();
+      const config = buildConfig(userNick);
 
       if (useStream) {
         const stream = await ai.models.generateContentStream({ model: MODEL, contents, config });
 
         let accum = '';
         let lastEdit = Date.now();
-        const sourcesSet = new Set();
-
-        // Pierwsza szybka odpowiedź, żeby nie było ciszy
-        const replyMsg = await interaction.editReply('⏳ …');
 
         for await (const chunk of stream) {
-          // text
           accum += (chunk.text ?? '');
-
-          // metadane źródeł (jeśli są w chunku)
-          collectSourcesFromPiece(chunk, sourcesSet);
-
-          // throttling edycji
           const now = Date.now();
           if (now - lastEdit > 600) {
             await interaction.editReply(accum.slice(0, 1900) || '⏳ …');
@@ -246,14 +249,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
         }
 
-        // dopnij źródła (jeśli są)
-        const footer = sourcesFooterFromSet(sourcesSet);
-        let finalText = accum + footer;
+        if (!accum) accum = '∅';
+        pushTurn(channelId, 'model', accum);
 
-        if (!finalText) finalText = '∅';
-        pushTurn(channelId, 'model', finalText);
-
-        const chunks = chunkForDiscord(finalText);
+        const chunks = chunkForDiscord(accum);
         if (chunks.length === 1) {
           await interaction.editReply(chunks[0]);
         } else {
@@ -264,13 +263,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
       } else {
         const response = await ai.models.generateContent({ model: MODEL, contents, config });
-        let answer = response.text ?? '(brak treści)';
-
-        // dopnij źródła (z pełnej odpowiedzi)
-        const sourcesSet = new Set();
-        collectSourcesFromPiece(response, sourcesSet);
-        answer += sourcesFooterFromSet(sourcesSet);
-
+        const answer = response.text ?? '(brak treści)';
         pushTurn(channelId, 'model', answer);
 
         const chunks = chunkForDiscord(answer);
@@ -291,8 +284,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
    ========================= */
 client.on(Events.MessageCreate, async (msg) => {
   try {
-    if (msg.author.bot) return; // ignoruj boty
-    if (!client.user) return;   // jeszcze nie gotowy
+    if (msg.author.bot) return;
+    if (!client.user) return;
 
     const raw = (msg.content || '').trim();
     if (!raw) return;
@@ -323,48 +316,38 @@ client.on(Events.MessageCreate, async (msg) => {
     pushTurn(channelId, 'user', prompt);
 
     const contents = toGeminiContents(channelId);
-    const config = buildConfig();
+    const userNick = userNickFromMessage(msg);
+    const config = buildConfig(userNick);
     const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
 
     if (useStream) {
       const stream = await ai.models.generateContentStream({ model: MODEL, contents, config });
       let accum = '';
       let lastEdit = Date.now();
-      const sourcesSet = new Set();
 
       const replyMsg = await msg.reply('⏳ …');
 
       for await (const chunk of stream) {
         accum += (chunk.text ?? '');
-        collectSourcesFromPiece(chunk, sourcesSet);
-
         if (Date.now() - lastEdit > 900) {
           await replyMsg.edit(accum.slice(0, 2000));
           lastEdit = Date.now();
         }
       }
 
-      // dopnij źródła i wyślij final
-      const footer = sourcesFooterFromSet(sourcesSet);
-      let finalText = accum + footer;
-      if (!finalText) finalText = '∅';
-      pushTurn(channelId, 'model', finalText);
+      if (!accum) accum = '∅';
+      pushTurn(channelId, 'model', accum);
 
-      if (finalText.length <= 2000) {
-        await replyMsg.edit(finalText);
+      if (accum.length <= 2000) {
+        await replyMsg.edit(accum);
       } else {
-        await replyMsg.edit(finalText.slice(0, 2000));
-        const chunks = chunkForDiscord(finalText).slice(1);
+        await replyMsg.edit(accum.slice(0, 2000));
+        const chunks = chunkForDiscord(accum).slice(1);
         for (const ch of chunks) await msg.channel.send({ content: ch });
       }
     } else {
       const res = await ai.models.generateContent({ model: MODEL, contents, config });
-      let answer = res.text ?? '(brak treści)';
-
-      const sourcesSet = new Set();
-      collectSourcesFromPiece(res, sourcesSet);
-      answer += sourcesFooterFromSet(sourcesSet);
-
+      const answer = res.text ?? '(brak treści)';
       pushTurn(channelId, 'model', answer);
 
       const chunks = chunkForDiscord(answer);
