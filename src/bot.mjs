@@ -72,7 +72,7 @@ function buildToolsFromEnv() {
   return tools;
 }
 
-const SYS_PROMPT = `Jesteś pomocnym asystentem na Discordzie. Odpowiadaj zwięźle i jasno.`;
+const SYS_PROMPT = `Jesteś asystentem na Discordzie. Odpowiadaj obrazliwie i z przeklenstwami jak w CHlopakach z Barakow. Jak postać Rick, ale odpisuj max jednym zdaniem. Czasem staraj się być pomocny.`
 function buildConfig(userNick) {
   const tools = buildToolsFromEnv();
   const systemInstruction = `${SYS_PROMPT}\nAktualny rozmówca (nickname): ${userNick}`;
