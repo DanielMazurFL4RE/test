@@ -74,64 +74,16 @@ function buildToolsFromEnv() {
   return tools;
 }
 
-/* Styl/zasady — możesz dostroić pod siebie */
-const SYS_PROMPT = `Jesteś asystentem na Discordzie. Odpowiadaj obrazliwie i z przeklenstwami jak w CHlopakach z Barakow. Jak postać Rick, ale odpisuj max jednym zdaniem. Czasem staraj się być pomocny. Odpowiadaj krótko (1-2 zdania). Nie myl rozmówców: zawsze kojarz wypowiedzi z właściwymi nickami.
+/* Persona/system prompt — LEKKI (reszta w cache) */
+const PERSONA = `Jesteś asystentem na Discordzie. Odpowiadaj obrazliwie i z przeklenstwami jak w CHlopakach z Barakow. Jak postać Rick, ale odpisuj max jednym zdaniem. Czasem staraj się być pomocny. Odpowiadaj krótko (1-2 zdania). Nie myl rozmówców: zawsze kojarz wypowiedzi z właściwymi nickami.
 Masz dwie warstwy pamięci: prywatną (bieżący użytkownik) i wspólną dla kanału (ostatnie wypowiedzi różnych osób).`;
 
-function buildConfig(userNick, participantsHint) {
-  const tools = buildToolsFromEnv();
-  const systemInstruction =
-    `${SYS_PROMPT}\nAktualny rozmówca: ${userNick}\n` +
-    (participantsHint ? `W kanale obecni (ostatnio): ${participantsHint}` : '');
-  return {
-    systemInstruction,
-    temperature: 0.5,
-    ...(tools.length ? { tools } : {})
-  };
-}
-
 /* =========================
-   Komendy (auto-register)
-   ========================= */
-const commands = [
-  new SlashCommandBuilder()
-    .setName('gemini')
-    .setDescription('Porozmawiaj z Gemini')
-    .addStringOption(o =>
-      o.setName('prompt')
-        .setDescription('Twoja wiadomość do Gemini')
-        .setRequired(true)
-    )
-    .addBooleanOption(o =>
-      o.setName('ephemeral')
-        .setDescription('Pokaż odpowiedź tylko Tobie (domyślnie: nie)')
-    )
-    .toJSON(),
-  new SlashCommandBuilder()
-    .setName('gemini-reset')
-    .setDescription('Wyczyść twój kontekst w tym kanale')
-    .toJSON()
-];
-const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
-
-/* =========================
-   Discord client
-   ========================= */
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.DirectMessages
-  ],
-  partials: [Partials.Channel]
-});
-
-/* =========================
-   Pamięć: prywatna + wspólna
+   Pamięć: prywatna + wspólna + skróty + cache
    ========================= */
 const MAX_TURNS_PRIVATE = parseInt(process.env.MEM_TURNS_PRIVATE || '12', 10);
-const MAX_TURNS_SHARED  = parseInt(process.env.MEM_TURNS_SHARED  || '10', 10);
+const MAX_TURNS_SHARED  = parseInt(process.env.MEM_TURNS_SHARED  || '8', 10);
+const CACHE_TTL_SEC     = parseInt(process.env.GEMINI_CACHE_TTL_SEC || '3600', 10);
 
 // Prywatna per (kanał + user)
 const userMemory = new Map(); // `${channelId}:${userId}` -> [{role:'user'|'model', text}]
@@ -159,27 +111,114 @@ function pushSharedTurn(channelId, speaker, text) {
   sharedMemory.set(channelId, h.slice(-MAX_TURNS_SHARED));
 }
 
-// Zbuduj treść dla Gemini: prywatna rozmowa + zwięzły kontekst kanału
-function toGeminiContents(sk, channelId, myNick) {
+// Skrót rozmowy per sesja (lekki tekst)
+const sessionSummary = new Map(); // sk -> string
+
+// Cache name per sesja
+const sessionCache = new Map(); // sk -> { name, createdAt }
+
+/* Szacowanie tokenów „na oko” (dla progów, nie do rozliczeń) */
+const roughTokens = (s) => Math.ceil((s || '').length / 4);
+
+/* Buduje skrót, gdy historia rośnie */
+async function summarizeIfNeeded(sk, channelId) {
   const priv = getUserHist(sk);
   const shared = getSharedHist(channelId);
 
-  const contents = priv.map(m => ({
+  // szybkie sprawdzenie wielkości
+  const privText = priv.map(t => `${t.role}: ${t.text}`).join('\n');
+  const sharedText = shared.map(t => `[@${t.speaker}]: ${t.text}`).join('\n');
+  const combined = `${privText}\n---\n${sharedText}`;
+
+  if (priv.length <= MAX_TURNS_PRIVATE && roughTokens(combined) < 6000) return;
+
+  const prompt = [
+    { role: 'user', parts: [{ text:
+`Stwórz bardzo krótki skrót rozmowy w punktach (max 10 linii), z zachowaniem mówców.
+Formatuj: [@Nick]: treść. Bez dygresji, same fakty, decyzje, ustalenia.
+
+[PRYWATNE]:
+${privText.slice(-8000)}
+
+[WSPÓLNE KANAŁU]:
+${sharedText.slice(-4000)}
+` }]}
+  ];
+
+  try {
+    const res = await ai.models.generateContent({ model: MODEL, contents: prompt });
+    const summary = (res.text || '').slice(0, 4000);
+    if (summary) sessionSummary.set(sk, summary);
+
+    // przytnij surową pamięć po streszczeniu (zostaw 4 najnowsze tury)
+    const tail = priv.slice(-4);
+    userMemory.set(sk, tail);
+  } catch (e) {
+    console.warn('⚠️ Nie udało się zbudować skrótu:', e?.message || e);
+  }
+}
+
+/* Tworzy/uzupełnia cache: persona + skrót sesji */
+async function ensureSessionCache(sk) {
+  const existing = sessionCache.get(sk);
+  if (existing && (Date.now() - existing.createdAt) / 1000 < CACHE_TTL_SEC) {
+    return existing.name; // świeży
+  }
+
+  const summaryText = sessionSummary.get(sk) || '';
+  // Spróbuj dwóch kształtów API (różne wersje SDK):
+  try {
+    const cache = await ai.caches.create({
+      model: MODEL,
+      // część stała do cache: persona + obecny skrót rozmowy
+      config: {
+        systemInstruction: PERSONA,
+        contents: summaryText ? [{ role: 'user', parts: [{ text: summaryText }]}] : [],
+        ttl: `${CACHE_TTL_SEC}s`,
+      },
+    });
+    sessionCache.set(sk, { name: cache.name, createdAt: Date.now() });
+    return cache.name;
+  } catch (e1) {
+    try {
+      const cache = await ai.caches.create({
+        model: MODEL,
+        contents: summaryText ? [{ role: 'user', parts: [{ text: summaryText }]}] : [],
+        ttlSeconds: CACHE_TTL_SEC,
+      });
+      sessionCache.set(sk, { name: cache.name, createdAt: Date.now() });
+      return cache.name;
+    } catch (e2) {
+      console.warn('⚠️ Cache niedostępny – lecimy bez cache.', e2?.message || e2);
+      return null;
+    }
+  }
+}
+
+/* Składanie wejścia do modelu — małe okno + krótkie wspólne */
+function toWindowedContents(sk, channelId, myNick) {
+  const priv = getUserHist(sk).slice(-6).map(m => ({
     role: m.role === 'model' ? 'model' : 'user',
     parts: [{ text: m.text }]
   }));
 
-  if (shared.length) {
-    const ctxLines = shared
-      .map(t => `[@${t.speaker}]: ${t.text}`)
-      .join('\n')
-      .slice(-3000); // bezpieczne ograniczenie długości
-    contents.push({
-      role: 'user',
-      parts: [{ text: `Kontekst kanału (ostatnie wypowiedzi różnych osób):\n${ctxLines}\nMój nick: ${myNick}. Nie myl mówców.` }]
-    });
-  }
-  return contents;
+  const shared = getSharedHist(channelId).slice(-5);
+  const sharedBlock = shared.length
+    ? [{
+        role: 'user',
+        parts: [{ text: `Kontekst kanału (ostatnie wypowiedzi):\n${
+          shared.map(t => `[@${t.speaker}]: ${t.text}`).join('\n')
+        }\nNie myl mówców; mój nick: ${myNick}.` }]
+      }]
+    : [];
+
+  // dodaj krótki „nagłówek sesji” jako user-msg (bez powiększania systemInstruction)
+  const header = [{
+    role: 'user',
+    parts: [{ text: `Aktualny rozmówca: ${myNick}. Odpowiadaj zwięźle.` }]
+  }];
+
+  return [...header, ...priv, ...sharedBlock];
 }
 
 function chunkForDiscord(text, limit = 2000) {
@@ -192,6 +231,37 @@ function chunkForDiscord(text, limit = 2000) {
 /* =========================
    Auto-rejestracja + nick
    ========================= */
+const commands = [
+  new SlashCommandBuilder()
+    .setName('gemini')
+    .setDescription('Porozmawiaj z Gemini')
+    .addStringOption(o =>
+      o.setName('prompt')
+        .setDescription('Twoja wiadomość do Gemini')
+        .setRequired(true)
+    )
+    .addBooleanOption(o =>
+      o.setName('ephemeral')
+        .setDescription('Pokaż odpowiedź tylko Tobie (domyślnie: nie)')
+    )
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName('gemini-reset')
+    .setDescription('Wyczyść twój kontekst w tym kanale')
+    .toJSON()
+];
+const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages
+  ],
+  partials: [Partials.Channel]
+});
+
 async function setBotNicknameInGuild(guild) {
   try {
     await guild.members.fetchMe();
@@ -233,16 +303,18 @@ client.on('guildCreate', async (guild) => {
 });
 
 /* =========================
-   Slash commands
+   Obsługa komend
    ========================= */
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  const sk = skFromInteraction(interaction);
+  const sk = `${interaction.channelId}:${interaction.user.id}`;
   const channelId = interaction.channelId;
 
   if (interaction.commandName === 'gemini-reset') {
     userMemory.delete(sk);
+    sessionSummary.delete(sk);
+    sessionCache.delete(sk);
     await interaction.reply({ content: '🧹 Twój kontekst w tym kanale wyczyszczony.', ephemeral: true });
     return;
   }
@@ -254,17 +326,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     try {
       const nick = userNickFromInteraction(interaction);
-      // zapis do obu pamięci
+
+      // zapisz do pamięci
       pushUserTurn(sk, 'user', userPrompt);
       pushSharedTurn(channelId, nick, userPrompt);
 
-      const participantsHint = [...new Set(getSharedHist(channelId).map(t => t.speaker))].join(', ');
-      const contents = toGeminiContents(sk, channelId, nick);
-      const config = buildConfig(nick, participantsHint);
+      // skróć jeśli trzeba + przygotuj cache
+      await summarizeIfNeeded(sk, channelId);
+      const cacheName = await ensureSessionCache(sk);
+
+      // zbuduj małe okno
+      const contents = toWindowedContents(sk, channelId, nick);
+
+      // config tylko z cache + ewentualnie tools
+      const tools = buildToolsFromEnv();
+      const genCfg = {
+        ...(cacheName ? { cachedContent: cacheName } : {}),
+        ...(tools.length ? { tools } : {})
+      };
+
       const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
 
       if (useStream) {
-        const stream = await ai.models.generateContentStream({ model: MODEL, contents, config });
+        const stream = await ai.models.generateContentStream({ model: MODEL, contents, config: genCfg });
         let accum = '';
         let lastEdit = Date.now();
 
@@ -277,9 +361,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
         if (!accum) accum = '∅';
 
-        // zapisz odpowiedź bota
+        // zapisz odpowiedź
         pushUserTurn(sk, 'model', accum);
-        pushSharedTurn(channelId, 'Ricky', accum); // opcjonalnie: w kanale też widać, co powiedział bot
+        pushSharedTurn(channelId, 'Ricky', accum);
 
         const chunks = chunkForDiscord(accum);
         if (chunks.length === 1) await interaction.editReply(chunks[0]);
@@ -290,7 +374,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           }
         }
       } else {
-        const res = await ai.models.generateContent({ model: MODEL, contents, config });
+        const res = await ai.models.generateContent({ model: MODEL, contents, config: genCfg });
         const answer = res.text ?? '(brak treści)';
 
         pushUserTurn(sk, 'model', answer);
@@ -310,7 +394,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 /* =========================
-   Wiadomości tekstowe (prefiksy + @mention)
+   Wiadomości (prefiksy + @mention)
    ========================= */
 client.on(Events.MessageCreate, async (msg) => {
   try {
@@ -337,21 +421,26 @@ client.on(Events.MessageCreate, async (msg) => {
 
     await msg.channel.sendTyping();
 
-    const sk = skFromMessage(msg);
+    const sk = `${msg.channelId}:${msg.author.id}`;
     const channelId = msg.channelId;
     const nick = userNickFromMessage(msg);
 
-    // zapis do obu pamięci
     pushUserTurn(sk, 'user', prompt);
     pushSharedTurn(channelId, nick, prompt);
 
-    const participantsHint = [...new Set(getSharedHist(channelId).map(t => t.speaker))].join(', ');
-    const contents = toGeminiContents(sk, channelId, nick);
-    const config = buildConfig(nick, participantsHint);
-    const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
+    await summarizeIfNeeded(sk, channelId);
+    const cacheName = await ensureSessionCache(sk);
 
+    const contents = toWindowedContents(sk, channelId, nick);
+    const tools = buildToolsFromEnv();
+    const genCfg = {
+      ...(cacheName ? { cachedContent: cacheName } : {}),
+      ...(tools.length ? { tools } : {})
+    };
+
+    const useStream = String(process.env.GEMINI_STREAM || 'true').toLowerCase() === 'true';
     if (useStream) {
-      const stream = await ai.models.generateContentStream({ model: MODEL, contents, config });
+      const stream = await ai.models.generateContentStream({ model: MODEL, contents, config: genCfg });
       let accum = '';
       let lastEdit = Date.now();
       const replyMsg = await msg.reply('⏳ …');
@@ -376,7 +465,7 @@ client.on(Events.MessageCreate, async (msg) => {
         for (const ch of chunks) await msg.channel.send({ content: ch });
       }
     } else {
-      const res = await ai.models.generateContent({ model: MODEL, contents, config });
+      const res = await ai.models.generateContent({ model: MODEL, contents, config: genCfg });
       const answer = res.text ?? '(brak treści)';
 
       pushUserTurn(sk, 'model', answer);
