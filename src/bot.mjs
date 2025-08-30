@@ -196,7 +196,7 @@ async function summarizeIfNeeded(sk, channelId) {
 
   const prompt = [
     { role: 'user', parts: [{ text:
-`Stwórz bardzo krótki skrót rozmowy w punktach (max 10 linii), z zachowaniem mówców.
+`Stwórz bardzo krótki skrót rozmowy w punktach (max 15 linii), z zachowaniem mówców.
 Formatuj: [@Nick]: treść. Bez dygresji, same fakty, decyzje, ustalenia.
 
 [PRYWATNE]:
