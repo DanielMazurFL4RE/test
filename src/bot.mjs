@@ -563,7 +563,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             lastEdit = Date.now();
           }
         }
-        if (!accum) accum = '∅';
+        if (!accum) accum = '***ricky śpi najebany***';
 
         pushUserTurn(sk, 'model', accum);
         pushSharedTurn(channelId, 'Ricky', accum);
